@@ -1,15 +1,12 @@
 ---
-name: landcover-download
-display_name: Global Land Cover Downloader
-version: 0.1.0
-author: rui.duobao
-license: MIT-0
-description: |
-  Download global land cover data from multiple sources including
+description: 'Download global land cover data from multiple sources including
+
   ESA WorldCover (10m), FROM-GLC (30m), and GlobeLand30 (30m).
+
   Supports STAC search and regional bbox subsetting.
-runtime: python>=3.8
-tags: [gis, remote-sensing, landcover, worldcover, stac, planetary-computer, earth-observation, 下载]
+
+  '
+name: landcover-download
 ---
 
 # Global Land Cover Downloader

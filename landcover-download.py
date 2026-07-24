@@ -16,8 +16,10 @@ When this script runs, it sends:
 * The bounding box to a STAC search API (Planetary Computer) or direct
   download URLs. No API keys, no local files, no PII are sent.
 
-What is NOT sent: any data from the local filesystem, any environment
-variables, any login credentials.
+What is NOT sent: any data from the local filesystem, any login credentials.
+Note: when LANDCOVER_DOWNLOAD_USE_PROXY=1 is set, the script may read
+proxy configuration from standard environment variables (HTTP_PROXY,
+HTTPS_PROXY) to route network traffic through your proxy.
 
 To suppress the one-line privacy notice: set ``LANDCOVER_DOWNLOAD_QUIET=1``.
 
