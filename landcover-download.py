@@ -264,7 +264,8 @@ def get_globeland30_url(year: int, tile_id: str) -> Optional[str]:
 def _format_tile_text(item: Dict[str, Any], idx: int) -> str:
     item_id = item.get("id", "?")
     props = item.get("properties", {})
-    datetime_str = props.get("datetime", "")[:10] or "?"
+    raw_dt = props.get("datetime") or ""
+    datetime_str = raw_dt[:10] if raw_dt else "?"
     assets = list(item.get("assets", {}).keys())
     assets_str = " ".join(assets) if assets else "-"
     if len(assets_str) > 60:
