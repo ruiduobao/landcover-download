@@ -1,12 +1,6 @@
 ---
-description: 'Download global land cover data from multiple sources including
-
-  ESA WorldCover (10m), FROM-GLC (30m), and GlobeLand30 (30m).
-
-  Supports STAC search and regional bbox subsetting.
-
-  '
 name: landcover-download
+description: 'Download global land cover data from multiple sources including description: 'Download global land cover data from multiple sources including  ESA WorldCover (10m), FROM-GLC (30m), and GlobeLand30 (30m).  Supports STAC search and regional bbox subsetting.  '
 ---
 
 # Global Land Cover Downloader
