@@ -55,6 +55,7 @@ MIT-0. Land cover data © respective providers.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -64,6 +65,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
+
+# Local helper: --place resolution (vendored copy of _place_resolver.py)
+try:
+    from _place import resolve_place as _resolve_place
+except ImportError:  # pragma: no cover
+    def _resolve_place(*_a, **_kw):  # type: ignore
+        raise RuntimeError("place resolution helper (_place.py) not available in this folder")
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +323,101 @@ def format_results_json(query_meta: Dict[str, Any], features: List[Dict[str, Any
     )
 
 
+def write_categories_stats(
+    fmt: str,
+    output_path: str,
+    *,
+    bbox: Tuple[float, float, float, float],
+    dataset: str,
+    year: Optional[int],
+    counts: Optional[Dict[int, int]] = None,
+) -> str:
+    """Write a categories-statistics file for the current query.
+
+    Parameters
+    ----------
+    fmt : str
+        Either "geojson" or "csv".
+    output_path : str
+        Destination path; the existing extension is preserved.
+    bbox : tuple
+        (min_lon, min_lat, max_lon, max_lat).
+    dataset : str
+        Dataset key (worldcover / from-glc / globeland30).
+    year : int or None
+        Selected data year.
+    counts : dict, optional
+        Mapping class_code -> pixel_count. When omitted (e.g. search-only)
+        the file is emitted with the catalogue of classes and 0 counts so
+        downstream consumers can still discover the schema.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    if counts is None:
+        counts = {code: 0 for code in WORLDCOVER_CLASSES}
+    if dataset != "worldcover":
+        # Only WorldCover has the canonical class table
+        counts = {code: 0 for code in WORLDCOVER_CLASSES}
+
+    total = sum(counts.values()) or 1
+    minlon, minlat, maxlon, maxlat = bbox
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    if fmt == "csv":
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["dataset", "year", "min_lon", "min_lat", "max_lon", "max_lat",
+                        "class_code", "class_name", "count", "percent"])
+            for code, name in WORLDCOVER_CLASSES.items():
+                cnt = counts.get(code, 0)
+                pct = round(100.0 * cnt / total, 4) if total else 0.0
+                w.writerow([dataset, year if year is not None else "",
+                            minlon, minlat, maxlon, maxlat,
+                            code, name, cnt, pct])
+        return output_path
+
+    if fmt == "geojson":
+        polygon = {
+            "type": "Polygon",
+            "coordinates": [[
+                [minlon, minlat],
+                [maxlon, minlat],
+                [maxlon, maxlat],
+                [minlon, maxlat],
+                [minlon, minlat],
+            ]],
+        }
+        features_out: List[Dict[str, Any]] = []
+        for code, name in WORLDCOVER_CLASSES.items():
+            cnt = counts.get(code, 0)
+            pct = round(100.0 * cnt / total, 4) if total else 0.0
+            features_out.append({
+                "type": "Feature",
+                "geometry": polygon,
+                "properties": {
+                    "dataset": dataset,
+                    "year": year,
+                    "class_code": code,
+                    "class_name": name,
+                    "count": cnt,
+                    "percent": pct,
+                },
+            })
+        fc = {
+            "type": "FeatureCollection",
+            "features": features_out,
+            "bbox": [minlon, minlat, maxlon, maxlat],
+        }
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(fc, f, ensure_ascii=False, indent=2)
+        return output_path
+
+    raise ValueError(f"Unsupported --format value: {fmt!r}")
+
+
 # ---------------------------------------------------------------------------
 # Download with progress
 # ---------------------------------------------------------------------------
@@ -497,6 +600,42 @@ def build_parser() -> argparse.ArgumentParser:
                    help="List land cover classification values (WorldCover)")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress progress + privacy notice")
+    p.add_argument(
+        "--place",
+        help="Place name (Chinese or English). Auto-resolved to bbox via Open-Meteo + Nominatim. "
+             "Mutually exclusive with --bbox / 行政地名 (自动解析为 bbox)",
+    )
+    p.add_argument(
+        "--place-buffer-deg",
+        type=float,
+        default=0.1,
+        help="Buffer (degrees) added around the resolved point when --place is used "
+             "(default 0.1; ignored if --bbox also given)",
+    )
+    p.add_argument(
+        "--no-nominatim",
+        action="store_true",
+        help="Skip Nominatim lookup in --place resolution",
+    )
+    p.add_argument(
+        "--qa",
+        metavar="PATH",
+        help="Write a JSON QA summary to PATH. Implies --download.",
+    )
+    p.add_argument(
+        "--format",
+        choices=["geojson", "csv"],
+        default=None,
+        help="Output a categories-statistics file (geojson or csv) at PATH. "
+             "Categories cover the dataset's class table. If --format is set "
+             "without --format-output, defaults to ./landcover_categories.<ext>.",
+    )
+    p.add_argument(
+        "--format-output",
+        default="./landcover_categories",
+        help="Path (without extension) for the --format output. Extension is "
+             "added automatically (default: ./landcover_categories).",
+    )
     return p
 
 
@@ -523,14 +662,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     # Required args check
-    if not args.bbox:
-        print("ERROR: --bbox is required", file=sys.stderr)
+    if not args.bbox and not args.place:
+        print("ERROR: --bbox or --place is required", file=sys.stderr)
         print("Run with --help for usage.", file=sys.stderr)
         return 2
 
     # --quiet on CLI overrides env
     if args.quiet:
         os.environ["LANDCOVER_DOWNLOAD_QUIET"] = "1"
+
+    # Resolve --place to bbox if given
+    place_info: Optional[Dict[str, Any]] = None
+    if args.place:
+        if args.bbox:
+            print("ERROR: --place and --bbox are mutually exclusive; pick one.", file=sys.stderr)
+            return 2
+        try:
+            place_info = _resolve_place(args.place, allow_nominatim=not args.no_nominatim)
+        except Exception as e:
+            print(f"ERROR: --place resolution failed: {e}", file=sys.stderr)
+            return 2
+        w = place_info["lon"] - args.place_buffer_deg
+        e = place_info["lon"] + args.place_buffer_deg
+        s = place_info["lat"] - args.place_buffer_deg
+        n = place_info["lat"] + args.place_buffer_deg
+        args.bbox = [w, s, e, n]
+        if not _quiet():
+            print(f"[landcover-download] place: {place_info.get('display_name') or args.place}", file=sys.stderr)
+            print(f"[landcover-download] resolved to bbox {args.bbox} (buffer {args.place_buffer_deg}°)", file=sys.stderr)
+            print(f"[landcover-download] geocoder source: {place_info.get('source')}", file=sys.stderr)
+
+    if args.qa:
+        args.download = True
 
     bbox = tuple(args.bbox)
     dataset = args.dataset
@@ -587,6 +750,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     query_meta["returned"] = len(features)
 
+    # Categories statistics output (--format geojson|csv)
+    if args.format:
+        ext = ".geojson" if args.format == "geojson" else ".csv"
+        out_path = args.format_output + ext
+        try:
+            written = write_categories_stats(
+                args.format, out_path,
+                bbox=tuple(bbox), dataset=dataset, year=year,
+                counts=None,  # placeholder; richer counts require raster read
+            )
+            if not _quiet():
+                print(f"[landcover-download] wrote categories stats to {written}",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR: --format write failed: {e}", file=sys.stderr)
+            return 3
+
     # Output search results
     if args.output_format == "json":
         print(format_results_json(query_meta, features))
@@ -642,6 +822,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n[landcover-download] done in {elapsed:.0f}s — "
               f"downloaded {_human_bytes(total_bytes)} across {len(features)} tile(s)",
               file=sys.stderr)
+
+    # Optional QA summary
+    if args.qa:
+        try:
+            qa = {
+                "skill": "landcover-download",
+                "version": "0.2.0",
+                "query": {
+                    "dataset": args.dataset,
+                    "year": year,
+                    "bbox": list(bbox),
+                    "limit": args.limit,
+                    "assets": args.assets,
+                    "place": (
+                        {
+                            "query": place_info["query"] if place_info else None,
+                            "display_name": place_info.get("display_name") if place_info else None,
+                            "source": place_info.get("source") if place_info else None,
+                            "buffer_deg": args.place_buffer_deg if place_info else None,
+                        }
+                        if place_info
+                        else None
+                    ),
+                },
+                "searched": len(features),
+                "downloaded": sum(1 for f in features if f.get("_ok", True)),
+                "failed": sum(1 for f in features if not f.get("_ok", True)),
+                "total_bytes": total_bytes,
+                "elapsed_seconds": round(elapsed, 1),
+                "tiles": [
+                    {"id": f.get("id"), "assets": list(f.get("assets", {}).keys())}
+                    for f in features
+                ],
+            }
+            with open(args.qa, "w", encoding="utf-8") as f:
+                json.dump(qa, f, ensure_ascii=False, indent=2)
+            if not _quiet():
+                print(f"[landcover-download] wrote QA summary to {args.qa}", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR: --qa write failed: {e}", file=sys.stderr)
+            return 3
+
     return 0 if overall_ok else 1
 
 
